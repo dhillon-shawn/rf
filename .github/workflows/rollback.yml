@@ -1,0 +1,213 @@
+name: Get PR number on issue reopen
+on:
+  issues:
+    types: [reopened]
+
+permissions:
+  write-all
+
+env:
+  scope: "OR.Assets OR.BackgroundTasks OR.Execution OR.Folders OR.Jobs OR.Machines.Read OR.Monitoring OR.Robots.Read OR.Settings.Read OR.TestSets OR.TestSetExecutions OR.TestSetSchedules OR.Users.Read"
+
+jobs:
+  prep:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.parse.outputs.version }}
+      pid: ${{ steps.parse.outputs.pid }}
+      folder: ${{ steps.parse.outputs.folder }}
+    steps:
+      - id: find
+        uses: actions/github-script@v7
+        with:
+          result-encoding: string
+          script: |
+            const {owner, repo} = context.repo;
+            const issue_number = context.payload.issue.number;
+            const re = /https?:\/\/github\.com\/[^/]+\/[^/]+\/pull\/(\d+)/;
+
+            let page = 1, pr = null;
+            while (!pr) {
+              const {data} = await github.rest.issues.listComments({
+                owner, repo, issue_number, per_page: 100, page,
+                sort: 'created', direction: 'desc'
+              });
+              for (const c of data) { const m = re.exec(c.body || ''); if (m) { pr = m[1]; break; } }
+              if (data.length < 100) break; page++;
+            }
+            if (!pr) { core.setFailed('No PR URL found in comments.'); return; }
+            core.setOutput('pr_number', pr); return pr;
+
+      - name: Use it
+        run: echo "PR number ${{ steps.find.outputs.result }}"
+
+      - name: Build release tag
+        id: tag
+        run: |
+            echo "value=rc-pr-${{ steps.find.outputs.result }}" >> "$GITHUB_OUTPUT"
+            echo "tag: $value"
+      - name: Download rc-meta.json from release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p tmp
+          gh release download "${{ steps.tag.outputs.value }}" \
+            --repo "${{ github.repository }}" \
+            --dir tmp \
+            --pattern 'rc-meta.json' \
+            --clobber
+
+          test -f tmp/rc-meta.json || { echo "::error::rc-meta.json not found in release"; exit 1; }
+
+      - name: Parse rc-meta.json
+        id: parse
+        run: |
+          set -euo pipefail
+          file="tmp/rc-meta.json"
+          folder=$(jq -er '.folder' "$file")
+          version=$(jq -er '.version | tostring' "$file")
+          pid=$(jq -er '.pid' "$file")
+
+          {
+            echo "folder=$folder"
+            echo "version=$version"
+            echo "pid=$pid"
+          } >> "$GITHUB_OUTPUT"
+
+
+      - name: print
+        run: |
+          echo "folder:  ${{ steps.parse.outputs.folder }}"
+          echo "version: ${{ steps.parse.outputs.version }}"
+          echo "pid:     ${{ steps.parse.outputs.pid }}"
+
+  rollback:
+    runs-on: ubuntu-latest
+    needs: [prep]
+    strategy:
+      fail-fast: false
+      matrix:
+        env: ['dev', 'test', 'prod']
+    steps:
+
+
+      - name: auth
+        uses: dhillon-shawn/Local-CICD-UTILS/auth@v0
+        with:
+          target_env: ${{ matrix.env }}
+          role_arn: ${{ secrets.RPA_UIPATH_CICD_ROLE_ARN }}
+          aws_region: "us-west-2"
+          secret_id: ${{ secrets.RPA_UIPATH_CICD_SECRET_ARN }}
+          scopes: ${{ env.scope }}
+
+
+      - name: check release
+        shell: bash
+        run: |
+          echo "checking release"
+          body="$(mktemp)"
+          trap 'rm -f "$body"' EXIT
+
+          curl_rc=0
+          status=$(
+            curl -L -sS \
+              --connect-timeout 10 --max-time 120 \
+              --output "$body" \
+              --write-out '%{http_code}' \
+              -H "Authorization: Bearer ${{ env.TOKEN }}" \
+              -H "Content-Type: application/json" \
+              -H "X-UIPATH-FolderPath: ${{ needs.prep.outputs.folder }}" \
+              "${{ env.OR_URL }}/odata/Releases?%24select=Id%2CProcessKey%2CName%2CProcessType&%24filter=ProcessKey%20eq%20%27${{ needs.prep.outputs.pid }}%27"
+          ) || curl_rc=$?
+
+          echo "Status Code: $status"
+          echo "::group::Response body"
+          if [[ -s "$body" ]] && command -v jq >/dev/null && jq -e . "$body" >/dev/null 2>&1; then
+            jq -r . "$body"
+          else
+            cat "$body"
+          fi
+          echo "::endgroup::"
+
+          id_found="$(jq -r '.value[0].Id // empty' "$body" 2>/dev/null || true)"
+          echo "id_found=$id_found" >> "$GITHUB_ENV"
+
+          if [[ $curl_rc -ne 0 || ${status:-0} -ge 400 ]]; then
+            exit 1
+          fi
+
+
+      - name: get version
+        id: version
+        shell: bash
+        run: |
+            RESP=$(
+              curl -L -sS \
+                -H "Authorization: Bearer ${{ env.TOKEN }}" \
+                -H "Content-Type: application/json" \
+                -H "X-UIPATH-FolderPath: ${{ needs.prep.outputs.folder }}" \
+                "${{ env.OR_URL }}/odata/Processes/UiPath.Server.Configuration.OData.GetProcessVersions(processId='${{ needs.prep.outputs.pid }}')?%24select=Version%2CPublished&%24filter=Version%20eq%20%27${{ needs.prep.outputs.version }}%27"
+            )
+
+            INPUT_TS=$(echo "$RESP" | jq -r '.value[0].Published // empty')
+            if [ -z "$INPUT_TS" ] || [ "$INPUT_TS" = "null" ]; then
+              echo "Input version '${{ needs.prep.outputs.version }}' not found for process '${{ needs.prep.outputs.pid }}'." >&2
+              exit 1
+            fi
+
+            INPUT_TS_ENC=$(printf '%s' "$INPUT_TS" | jq -sRr @uri)
+
+            PRIOR_JSON=$(
+              curl -L -sS \
+                -H "Authorization: Bearer ${{ env.TOKEN }}" \
+                -H "Content-Type: application/json" \
+                -H "X-UIPATH-FolderPath: ${{ needs.prep.outputs.folder }}" \
+                "${{ env.OR_URL }}/odata/Processes/UiPath.Server.Configuration.OData.GetProcessVersions(processId='${{ needs.prep.outputs.pid }}')?%24select=Version%2CPublished&%24filter=Published%20lt%20${INPUT_TS_ENC}&%24orderby=Published%20desc&%24top=1"
+            )
+
+            echo "Response: $PRIOR_JSON"
+
+            previous_version=$(echo "$PRIOR_JSON" | jq -r '.value[0].Version // empty')
+            if [ -z "$previous_version" ]; then
+              echo "No previous version found prior to Published=$INPUT_TS for process '${{ needs.prep.outputs.pid }}'." >&2
+              exit 1
+            fi
+
+            echo "PREV_VER=$previous_version" >> "$GITHUB_OUTPUT"
+
+
+
+      - name: rollback release
+        shell: bash
+        run: |
+          echo "rolling back release"
+          body="$(mktemp)"
+          trap 'rm -f "$body"' EXIT
+
+          curl_rc=0
+          status=$(
+            curl -L -sS \
+              --connect-timeout 10 --max-time 120 \
+              --output "$body" \
+              --write-out '%{http_code}' \
+              -X POST \
+              -H "Authorization: Bearer ${{  env.TOKEN }}" \
+              -H "Content-Type: application/json" \
+              -H "X-UIPATH-FolderPath: ${{ needs.prep.outputs.folder }}" \
+              --data-binary @- \
+              "${{ env.OR_URL }}/odata/Releases(${{ env.id_found}})/UiPath.Server.Configuration.OData.UpdateToSpecificPackageVersion" <<'JSON'
+          {
+            "packageVersion": "${{ steps.version.outputs.PREV_VER }}"
+          }
+          JSON
+          ) || curl_rc=$?
+
+          echo "Status Code: $status"
+          echo "::group::Response body"
+          if command -v jq >/dev/null; then jq -r . "$body" || cat "$body"; else cat "$body"; fi
+          echo "::endgroup::"
+
+          if [[ $curl_rc -ne 0 || ${status:-0} -ge 400 ]]; then
+            exit 1
+          fi
