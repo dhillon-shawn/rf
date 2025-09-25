@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  issue_to_pr:
+  parse:
     outputs:
       start:         ${{ steps.parse.outputs.start }}
       end:           ${{ steps.parse.outputs.end }}
