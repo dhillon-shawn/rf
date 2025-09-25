@@ -29,6 +29,7 @@ body:
     id: effort
     attributes:
       label: Effort/Project
+      options:
         - Defect Resolution
         - Executive Sponsor Projects
         - Maintenance and Operation
